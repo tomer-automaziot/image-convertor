@@ -189,3 +189,100 @@ async def sync_product_images(request: Request):
             results["errors"].append(f"DB update failed: {str(e)}")
 
     return {"success": True, "results": results}
+
+
+@app.post("/sync-all-images")
+async def sync_all_images(request: Request):
+    """Process all inventory products with external images, sequentially."""
+    if WEBHOOK_SECRET and request.headers.get("x-webhook-secret") != WEBHOOK_SECRET:
+        return Response(status_code=401, content="Unauthorized")
+
+    # Fetch all products with images
+    offset = 0
+    batch_size = 100
+    all_products = []
+    while True:
+        resp = supabase.table("inventory").select("sku, product_images, showroom_images").range(offset, offset + batch_size - 1).execute()
+        if not resp.data:
+            break
+        all_products.extend(resp.data)
+        if len(resp.data) < batch_size:
+            break
+        offset += batch_size
+
+    # Filter to products with external images
+    to_process = []
+    for p in all_products:
+        has_external = False
+        for img in (p.get("product_images") or []):
+            if img and not is_supabase_url(img):
+                has_external = True
+                break
+        if not has_external:
+            for img in (p.get("showroom_images") or []):
+                if img and not is_supabase_url(img):
+                    has_external = True
+                    break
+        if has_external:
+            to_process.append(p)
+
+    summary = {"total": len(to_process), "processed": 0, "failed": 0, "errors": []}
+
+    async with httpx.AsyncClient() as client:
+        for product in to_process:
+            sku = product["sku"]
+            try:
+                product_images = product.get("product_images") or []
+                showroom_images = product.get("showroom_images") or []
+                folder = sku_to_folder(sku)
+
+                items = []
+                for i, url in enumerate(product_images):
+                    if url and not is_supabase_url(url):
+                        items.append({"url": url, "base": f"{folder}/product_{i+1}", "type": "product"})
+                for i, url in enumerate(showroom_images):
+                    if url and not is_supabase_url(url):
+                        items.append({"url": url, "base": f"{folder}/showroom_{i+1}", "type": "showroom"})
+
+                new_product_urls = []
+                new_showroom_urls = []
+
+                for item in items:
+                    raw_bytes, content_type = await download_image(client, item["url"])
+                    converted, ext, mime = convert_image(raw_bytes, item["url"], content_type)
+                    full_path = item["base"] + ext
+                    public_url = upload_image(full_path, converted, mime)
+                    if item["type"] == "product":
+                        new_product_urls.append(public_url)
+                    else:
+                        new_showroom_urls.append(public_url)
+
+                update_data = {}
+                if new_product_urls:
+                    final = []
+                    url_iter = iter(new_product_urls)
+                    for url in product_images:
+                        if is_supabase_url(url):
+                            final.append(url)
+                        else:
+                            final.append(next(url_iter, url))
+                    update_data["product_images"] = final
+                if new_showroom_urls:
+                    final = []
+                    url_iter = iter(new_showroom_urls)
+                    for url in showroom_images:
+                        if is_supabase_url(url):
+                            final.append(url)
+                        else:
+                            final.append(next(url_iter, url))
+                    update_data["showroom_images"] = final
+
+                if update_data:
+                    supabase.table("inventory").update(update_data).eq("sku", sku).execute()
+
+                summary["processed"] += 1
+            except Exception as e:
+                summary["failed"] += 1
+                summary["errors"].append(f"{sku}: {str(e)}")
+
+    return {"success": True, "summary": summary}

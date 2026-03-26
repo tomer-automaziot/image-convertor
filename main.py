@@ -26,31 +26,28 @@ def is_supabase_url(url: str) -> bool:
 
 
 def convert_image(raw_bytes: bytes, source_url: str, content_type: str) -> tuple[bytes, str, str]:
-    """Convert image to JPEG or PNG. Returns (bytes, extension, mime_type)."""
-    url_lower = source_url.lower()
-
-    # Source is PNG - keep as PNG
-    if url_lower.endswith(".png") or "png" in content_type:
-        img = Image.open(io.BytesIO(raw_bytes))
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue(), ".png", "image/png"
-
-    # Source is already JPEG - pass through
-    if any(url_lower.endswith(ext) for ext in (".jpg", ".jpeg")) or "jpeg" in content_type:
-        return raw_bytes, ".jpeg", "image/jpeg"
-
-    # Everything else (webp, gif, bmp, tiff, avif) - convert to JPEG
+    """Convert any image to 8-bit JPEG. Returns (bytes, extension, mime_type)."""
     img = Image.open(io.BytesIO(raw_bytes))
-    if img.mode in ("RGBA", "P", "LA"):
-        # JPEG doesn't support transparency - composite on white background
-        background = Image.new("RGB", img.size, (255, 255, 255))
-        if img.mode == "P":
+
+    # Handle high bit-depth modes (10-bit/16-bit) → 8-bit
+    if img.mode in ("I;16", "I;16L", "I;16B", "I;16N"):
+        import numpy as np
+        arr = np.array(img, dtype=np.uint16)
+        arr = (arr >> 8).astype(np.uint8)
+        img = Image.fromarray(arr, mode="L")
+    elif img.mode in ("I", "F"):
+        img = img.convert("L")
+
+    # Handle transparency → composite on white background
+    if img.mode in ("RGBA", "P", "LA", "PA"):
+        if img.mode in ("P", "PA"):
             img = img.convert("RGBA")
+        background = Image.new("RGB", img.size, (255, 255, 255))
         background.paste(img, mask=img.split()[-1])
         img = background
     elif img.mode != "RGB":
         img = img.convert("RGB")
+
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
     return buf.getvalue(), ".jpeg", "image/jpeg"
@@ -70,7 +67,8 @@ def upload_image(path: str, data: bytes, content_type: str) -> str:
         file_options={"content-type": content_type, "upsert": "true", "cache-control": "3600"}
     )
     res = supabase.storage.from_(BUCKET).get_public_url(path)
-    return res
+    # Strip trailing '?' that supabase-py adds
+    return res.rstrip("?")
 
 
 def list_folder_files(folder: str) -> list[str]:

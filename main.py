@@ -1,28 +1,42 @@
 import os
 import re
 import io
-import json
 import httpx
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, Request, Response
 from PIL import Image
 from supabase import create_client
 
 app = FastAPI()
 
+# Supabase — used ONLY for reading `inventory` and writing `storage_files_railway`.
+# All storage operations have moved to Railway Bucket (S3-compatible) via boto3.
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-BUCKET = "product-images"
+
+# Railway Bucket (S3-compatible) config
+R2_ENDPOINT = os.environ["R2_ENDPOINT"]
+R2_ACCESS_KEY = os.environ["R2_ACCESS_KEY"]
+R2_SECRET_KEY = os.environ["R2_SECRET_KEY"]
+R2_BUCKET = os.environ["R2_BUCKET"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=R2_ENDPOINT,
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="us-east-1",  # placeholder; endpoint_url overrides
+)
 
 
 def sku_to_folder(sku: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "", sku)
-
-
-def is_supabase_url(url: str) -> bool:
-    return "supabase.co/storage/" in url
 
 
 def convert_image(raw_bytes: bytes, source_url: str, content_type: str) -> tuple[bytes, str, str]:
@@ -60,30 +74,78 @@ async def download_image(client: httpx.AsyncClient, url: str) -> tuple[bytes, st
     return resp.content, resp.headers.get("content-type", "")
 
 
-def upload_image(path: str, data: bytes, content_type: str) -> str:
-    """Upload to Supabase storage and return public URL."""
-    supabase.storage.from_(BUCKET).upload(
-        path, data,
-        file_options={"content-type": content_type, "upsert": "true", "cache-control": "3600"}
+def file_exists_in_bucket(path: str) -> bool:
+    """Check if an object exists in the Railway bucket. Idempotency gate."""
+    try:
+        s3.head_object(Bucket=R2_BUCKET, Key=path)
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+
+
+def upload_image(path: str, data: bytes, content_type: str) -> None:
+    """Upload to Railway bucket."""
+    s3.put_object(
+        Bucket=R2_BUCKET,
+        Key=path,
+        Body=data,
+        ContentType=content_type,
+        CacheControl="3600",
     )
-    res = supabase.storage.from_(BUCKET).get_public_url(path)
-    # Strip trailing '?' that supabase-py adds
-    return res.rstrip("?")
 
 
 def list_folder_files(folder: str) -> list[str]:
-    """List all files in a storage folder."""
+    """List all object keys in a bucket folder (prefix)."""
+    keys = []
+    prefix = folder.rstrip("/") + "/"
+    paginator = s3.get_paginator("list_objects_v2")
     try:
-        files = supabase.storage.from_(BUCKET).list(folder, {"limit": 1000})
-        return [f"{folder}/{f['name']}" for f in files if f.get("id")]
-    except Exception:
+        for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []) or []:
+                keys.append(obj["Key"])
+    except ClientError:
         return []
+    return keys
 
 
-def delete_files(paths: list[str]):
-    """Delete files from storage."""
-    if paths:
-        supabase.storage.from_(BUCKET).remove(paths)
+def delete_files(paths: list[str]) -> None:
+    """Delete objects from the Railway bucket (batched, S3 caps at 1000 per call)."""
+    if not paths:
+        return
+    for i in range(0, len(paths), 1000):
+        batch = [{"Key": p} for p in paths[i:i + 1000]]
+        s3.delete_objects(Bucket=R2_BUCKET, Delete={"Objects": batch, "Quiet": True})
+
+
+def upsert_storage_file_row(sku: str, path: str) -> None:
+    """Insert/update a row in storage_files_railway for this file.
+    Keyed on `path` so repeat uploads of the same key are idempotent on the DB side too.
+    """
+    folder, _, file_name = path.rpartition("/")
+    row = {
+        "product_id": sku,
+        "path": path,
+        "folder": folder,
+        "file_name": file_name,
+    }
+    # Upsert on `path` — requires a unique constraint on storage_files_railway.path
+    # (falls back to insert if the row doesn't exist)
+    supabase.table("storage_files_railway").upsert(row, on_conflict="path").execute()
+
+
+def delete_storage_file_rows(paths: list[str]) -> None:
+    """Delete rows from storage_files_railway whose `path` matches (orphan cleanup)."""
+    if not paths:
+        return
+    # Supabase `in_` filter — batch by 200 to keep URL length sane
+    for i in range(0, len(paths), 200):
+        batch = paths[i:i + 200]
+        try:
+            supabase.table("storage_files_railway").delete().in_("path", batch).execute()
+        except Exception:
+            pass  # don't fail the whole request on a DB-side cleanup error
 
 
 @app.get("/health")
@@ -106,103 +168,78 @@ async def sync_product_images(request: Request):
         return {"error": "SKU is required"}
 
     folder = sku_to_folder(sku)
-    results = {"uploaded": [], "deleted": [], "skipped": [], "errors": []}
+    results = {"uploaded": [], "already_present": [], "deleted": [], "errors": []}
 
-    # Collect items to process
+    # Collect every image in the payload — the Railway convertor processes ALL urls,
+    # not just "external" ones, because the Railway bucket starts empty and we're
+    # building the full mirror from scratch.
     items = []
     for i, url in enumerate(product_images):
-        if url and not is_supabase_url(url):
+        if url:
             items.append({"url": url, "base": f"{folder}/product_{i+1}", "type": "product"})
-        elif url and is_supabase_url(url):
-            results["skipped"].append(url)
-
     for i, url in enumerate(showroom_images):
-        if url and not is_supabase_url(url):
+        if url:
             items.append({"url": url, "base": f"{folder}/showroom_{i+1}", "type": "showroom"})
-        elif url and is_supabase_url(url):
-            results["skipped"].append(url)
 
-    if not items:
-        return {"success": True, "message": "No new images to sync", "results": results}
-
-    # Download, convert, upload
-    new_product_urls = []
-    new_showroom_urls = []
-    uploaded_paths = set()
+    # Track which bucket keys SHOULD exist for this SKU after this sync.
+    # Anything in the folder NOT in this set is an orphan.
+    expected_keys = set()
 
     async with httpx.AsyncClient() as client:
         for item in items:
+            # We don't yet know the file extension, but the current convertor
+            # always outputs .jpeg. Compute the target key up front.
+            target_key = item["base"] + ".jpeg"
+            expected_keys.add(target_key)
+
             try:
+                # Idempotency check — if the file is already in the Railway bucket,
+                # skip the download+convert+upload entirely.
+                if file_exists_in_bucket(target_key):
+                    results["already_present"].append(target_key)
+                    # Still upsert the DB row in case it drifted from the bucket.
+                    upsert_storage_file_row(sku, target_key)
+                    continue
+
                 raw_bytes, content_type = await download_image(client, item["url"])
                 converted, ext, mime = convert_image(raw_bytes, item["url"], content_type)
+                # Sanity: convert_image always returns .jpeg, but respect its choice
                 full_path = item["base"] + ext
-                public_url = upload_image(full_path, converted, mime)
+                expected_keys.discard(target_key)
+                expected_keys.add(full_path)
 
+                upload_image(full_path, converted, mime)
+                upsert_storage_file_row(sku, full_path)
                 results["uploaded"].append(full_path)
-                uploaded_paths.add(full_path)
-
-                if item["type"] == "product":
-                    new_product_urls.append(public_url)
-                else:
-                    new_showroom_urls.append(public_url)
             except Exception as e:
                 results["errors"].append(f"{item['base']}: {str(e)}")
 
-    # Clean up orphaned files
+    # Orphan cleanup — list everything in the SKU folder, delete anything not in expected_keys.
     existing = list_folder_files(folder)
-    to_delete = []
-    for path in existing:
-        if path not in uploaded_paths:
-            is_kept = any(path in url for url in results["skipped"])
-            if not is_kept:
-                to_delete.append(path)
+    to_delete = [k for k in existing if k not in expected_keys]
     if to_delete:
         delete_files(to_delete)
+        delete_storage_file_rows(to_delete)
         results["deleted"].extend(to_delete)
-
-    # Update inventory record
-    update_data = {}
-    if new_product_urls:
-        final = []
-        url_iter = iter(new_product_urls)
-        for url in product_images:
-            if is_supabase_url(url):
-                final.append(url)
-            else:
-                final.append(next(url_iter, url))
-        update_data["product_images"] = final
-
-    if new_showroom_urls:
-        final = []
-        url_iter = iter(new_showroom_urls)
-        for url in showroom_images:
-            if is_supabase_url(url):
-                final.append(url)
-            else:
-                final.append(next(url_iter, url))
-        update_data["showroom_images"] = final
-
-    if update_data:
-        try:
-            supabase.table("inventory").update(update_data).eq("sku", sku).execute()
-        except Exception as e:
-            results["errors"].append(f"DB update failed: {str(e)}")
 
     return {"success": True, "results": results}
 
 
 @app.post("/sync-all-images")
 async def sync_all_images(request: Request):
-    """Process all inventory products with external images, sequentially."""
+    """Process every inventory row, sequentially. Used for bulk catch-up migration."""
     if WEBHOOK_SECRET and request.headers.get("x-webhook-secret") != WEBHOOK_SECRET:
         return Response(status_code=401, content="Unauthorized")
 
-    # Fetch all products with images
+    # Fetch all products — we process every SKU that has ANY images in the payload,
+    # regardless of where those images currently live (vendor URL or Supabase).
     offset = 0
     batch_size = 100
     all_products = []
     while True:
-        resp = supabase.table("inventory").select("sku, product_images, showroom_images").range(offset, offset + batch_size - 1).execute()
+        resp = supabase.table("inventory").select(
+            "sku, product_images, showroom_images"
+        ).range(offset, offset + batch_size - 1).execute()
         if not resp.data:
             break
         all_products.extend(resp.data)
@@ -210,21 +247,11 @@ async def sync_all_images(request: Request):
             break
         offset += batch_size
 
-    # Filter to products with external images
-    to_process = []
-    for p in all_products:
-        has_external = False
-        for img in (p.get("product_images") or []):
-            if img and not is_supabase_url(img):
-                has_external = True
-                break
-        if not has_external:
-            for img in (p.get("showroom_images") or []):
-                if img and not is_supabase_url(img):
-                    has_external = True
-                    break
-        if has_external:
-            to_process.append(p)
+    # Filter to products with at least one image URL
+    to_process = [
+        p for p in all_products
+        if (p.get("product_images") or []) or (p.get("showroom_images") or [])
+    ]
 
     summary = {"total": len(to_process), "processed": 0, "failed": 0, "errors": []}
 
@@ -238,47 +265,37 @@ async def sync_all_images(request: Request):
 
                 items = []
                 for i, url in enumerate(product_images):
-                    if url and not is_supabase_url(url):
+                    if url:
                         items.append({"url": url, "base": f"{folder}/product_{i+1}", "type": "product"})
                 for i, url in enumerate(showroom_images):
-                    if url and not is_supabase_url(url):
+                    if url:
                         items.append({"url": url, "base": f"{folder}/showroom_{i+1}", "type": "showroom"})
 
-                new_product_urls = []
-                new_showroom_urls = []
+                expected_keys = set()
 
                 for item in items:
+                    target_key = item["base"] + ".jpeg"
+                    expected_keys.add(target_key)
+
+                    if file_exists_in_bucket(target_key):
+                        upsert_storage_file_row(sku, target_key)
+                        continue
+
                     raw_bytes, content_type = await download_image(client, item["url"])
                     converted, ext, mime = convert_image(raw_bytes, item["url"], content_type)
                     full_path = item["base"] + ext
-                    public_url = upload_image(full_path, converted, mime)
-                    if item["type"] == "product":
-                        new_product_urls.append(public_url)
-                    else:
-                        new_showroom_urls.append(public_url)
+                    expected_keys.discard(target_key)
+                    expected_keys.add(full_path)
 
-                update_data = {}
-                if new_product_urls:
-                    final = []
-                    url_iter = iter(new_product_urls)
-                    for url in product_images:
-                        if is_supabase_url(url):
-                            final.append(url)
-                        else:
-                            final.append(next(url_iter, url))
-                    update_data["product_images"] = final
-                if new_showroom_urls:
-                    final = []
-                    url_iter = iter(new_showroom_urls)
-                    for url in showroom_images:
-                        if is_supabase_url(url):
-                            final.append(url)
-                        else:
-                            final.append(next(url_iter, url))
-                    update_data["showroom_images"] = final
+                    upload_image(full_path, converted, mime)
+                    upsert_storage_file_row(sku, full_path)
 
-                if update_data:
-                    supabase.table("inventory").update(update_data).eq("sku", sku).execute()
+                # Orphan cleanup per SKU folder
+                existing = list_folder_files(folder)
+                to_delete = [k for k in existing if k not in expected_keys]
+                if to_delete:
+                    delete_files(to_delete)
+                    delete_storage_file_rows(to_delete)
 
                 summary["processed"] += 1
             except Exception as e:

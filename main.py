@@ -192,27 +192,52 @@ async def sync_product_images(request: Request):
             target_key = item["base"] + ".jpeg"
             expected_keys.add(target_key)
 
+            # Step-by-step with labeled errors so we know exactly which host/op failed.
             try:
-                # Idempotency check — if the file is already in the Railway bucket,
-                # skip the download+convert+upload entirely.
-                if file_exists_in_bucket(target_key):
-                    results["already_present"].append(target_key)
-                    # Still upsert the DB row in case it drifted from the bucket.
-                    upsert_storage_file_row(sku, target_key)
-                    continue
-
-                raw_bytes, content_type = await download_image(client, item["url"])
-                converted, ext, mime = convert_image(raw_bytes, item["url"], content_type)
-                # Sanity: convert_image always returns .jpeg, but respect its choice
-                full_path = item["base"] + ext
-                expected_keys.discard(target_key)
-                expected_keys.add(full_path)
-
-                upload_image(full_path, converted, mime)
-                upsert_storage_file_row(sku, full_path)
-                results["uploaded"].append(full_path)
+                exists = file_exists_in_bucket(target_key)
             except Exception as e:
-                results["errors"].append(f"{item['base']}: {str(e)}")
+                results["errors"].append(f"{item['base']} [head_object on Railway bucket]: {type(e).__name__}: {str(e)}")
+                continue
+
+            if exists:
+                results["already_present"].append(target_key)
+                try:
+                    upsert_storage_file_row(sku, target_key)
+                except Exception as e:
+                    results["errors"].append(f"{item['base']} [db upsert on Supabase]: {type(e).__name__}: {str(e)}")
+                continue
+
+            try:
+                raw_bytes, content_type = await download_image(client, item["url"])
+            except Exception as e:
+                results["errors"].append(f"{item['base']} [download from {item['url']}]: {type(e).__name__}: {str(e)}")
+                continue
+
+            try:
+                converted, ext, mime = convert_image(raw_bytes, item["url"], content_type)
+            except Exception as e:
+                results["errors"].append(f"{item['base']} [image conversion]: {type(e).__name__}: {str(e)}")
+                continue
+
+            full_path = item["base"] + ext
+            expected_keys.discard(target_key)
+            expected_keys.add(full_path)
+
+            try:
+                upload_image(full_path, converted, mime)
+            except Exception as e:
+                results["errors"].append(f"{item['base']} [put_object on Railway bucket]: {type(e).__name__}: {str(e)}")
+                continue
+
+            try:
+                upsert_storage_file_row(sku, full_path)
+            except Exception as e:
+                results["errors"].append(f"{item['base']} [db upsert on Supabase]: {type(e).__name__}: {str(e)}")
+                # File is already uploaded, so count it as uploaded but flag the db error
+                results["uploaded"].append(full_path)
+                continue
+
+            results["uploaded"].append(full_path)
 
     # Orphan cleanup — list everything in the SKU folder, delete anything not in expected_keys.
     existing = list_folder_files(folder)

@@ -3,13 +3,12 @@ import re
 import io
 import httpx
 import boto3
+import hmac
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, Header, HTTPException, Depends
 from PIL import Image
 from supabase import create_client
-
-app = FastAPI()
 
 # Supabase — used ONLY for reading `inventory` and writing `storage_files_railway`.
 # All storage operations have moved to Railway Bucket (S3-compatible) via boto3.
@@ -33,6 +32,21 @@ s3 = boto3.client(
     config=Config(signature_version="s3v4"),
     region_name="us-east-1",  # placeholder; endpoint_url overrides
 )
+
+app = FastAPI()
+
+
+def verify_webhook_secret(x_webhook_secret: str = Header(None)):
+    """
+    Require WEBHOOK_SECRET header on protected endpoints.
+    If env var is empty (e.g. local dev), skip the check — so deploy without the var doesn't break anything,
+    but in production we'll always set it.
+    Uses hmac.compare_digest for timing-safe comparison.
+    """
+    if not WEBHOOK_SECRET:
+        return  # not configured, allow through (dev mode)
+    if not x_webhook_secret or not hmac.compare_digest(x_webhook_secret, WEBHOOK_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid or missing webhook secret")
 
 
 def sku_to_folder(sku: str) -> str:
@@ -150,15 +164,12 @@ def delete_storage_file_rows(paths: list[str]) -> None:
 
 @app.get("/health")
 def health():
+    """Unprotected — used by Railway health check."""
     return {"status": "ok"}
 
 
 @app.post("/sync-product-images")
-async def sync_product_images(request: Request):
-    # Validate webhook secret
-    if WEBHOOK_SECRET and request.headers.get("x-webhook-secret") != WEBHOOK_SECRET:
-        return Response(status_code=401, content="Unauthorized")
-
+async def sync_product_images(request: Request, _: None = Depends(verify_webhook_secret)):
     payload = await request.json()
     sku = payload.get("sku")
     product_images = payload.get("product_images") or []
@@ -251,11 +262,8 @@ async def sync_product_images(request: Request):
 
 
 @app.post("/sync-all-images")
-async def sync_all_images(request: Request):
+async def sync_all_images(request: Request, _: None = Depends(verify_webhook_secret)):
     """Process every inventory row, sequentially. Used for bulk catch-up migration."""
-    if WEBHOOK_SECRET and request.headers.get("x-webhook-secret") != WEBHOOK_SECRET:
-        return Response(status_code=401, content="Unauthorized")
-
     # Fetch all products — we process every SKU that has ANY images in the payload,
     # regardless of where those images currently live (vendor URL or Supabase).
     offset = 0

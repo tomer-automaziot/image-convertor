@@ -22,6 +22,12 @@ R2_ACCESS_KEY = os.environ["R2_ACCESS_KEY"]
 R2_SECRET_KEY = os.environ["R2_SECRET_KEY"]
 R2_BUCKET = os.environ["R2_BUCKET"]
 
+# Public URL prefix for files stored in the Railway bucket.
+# Full URL to a file = f"{PUBLIC_URL_PREFIX}/{object_key}"
+# Used when writing `path` into storage_files_railway so the column contains
+# the complete URL to the file, not just the bucket key.
+PUBLIC_URL_PREFIX = f"{R2_ENDPOINT.rstrip('/')}/{R2_BUCKET}"
+
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 s3 = boto3.client(
@@ -51,6 +57,13 @@ def verify_webhook_secret(x_webhook_secret: str = Header(None)):
 
 def sku_to_folder(sku: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "", sku)
+
+
+def key_to_url(key: str) -> str:
+    """Convert an S3 object key (e.g. 'ALP2BLACK/product_1.jpeg') to the full public URL
+    (e.g. 'https://t3.storageapi.dev/product-media-j76sdh0db9v/ALP2BLACK/product_1.jpeg').
+    """
+    return f"{PUBLIC_URL_PREFIX}/{key.lstrip('/')}"
 
 
 def convert_image(raw_bytes: bytes, source_url: str, content_type: str) -> tuple[bytes, str, str]:
@@ -88,10 +101,11 @@ async def download_image(client: httpx.AsyncClient, url: str) -> tuple[bytes, st
     return resp.content, resp.headers.get("content-type", "")
 
 
-def file_exists_in_bucket(path: str) -> bool:
-    """Check if an object exists in the Railway bucket. Idempotency gate."""
+def file_exists_in_bucket(key: str) -> bool:
+    """Check if an object exists in the Railway bucket. Idempotency gate.
+    `key` is the S3 object key (e.g. 'ALP2BLACK/product_1.jpeg'), not a URL."""
     try:
-        s3.head_object(Bucket=R2_BUCKET, Key=path)
+        s3.head_object(Bucket=R2_BUCKET, Key=key)
         return True
     except ClientError as e:
         if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
@@ -99,11 +113,11 @@ def file_exists_in_bucket(path: str) -> bool:
         raise
 
 
-def upload_image(path: str, data: bytes, content_type: str) -> None:
-    """Upload to Railway bucket."""
+def upload_image(key: str, data: bytes, content_type: str) -> None:
+    """Upload to Railway bucket. `key` is the S3 object key, not a URL."""
     s3.put_object(
         Bucket=R2_BUCKET,
-        Key=path,
+        Key=key,
         Body=data,
         ContentType=content_type,
         CacheControl="3600",
@@ -111,7 +125,7 @@ def upload_image(path: str, data: bytes, content_type: str) -> None:
 
 
 def list_folder_files(folder: str) -> list[str]:
-    """List all object keys in a bucket folder (prefix)."""
+    """List all object keys in a bucket folder (prefix). Returns S3 keys, not URLs."""
     keys = []
     prefix = folder.rstrip("/") + "/"
     paginator = s3.get_paginator("list_objects_v2")
@@ -124,23 +138,27 @@ def list_folder_files(folder: str) -> list[str]:
     return keys
 
 
-def delete_files(paths: list[str]) -> None:
-    """Delete objects from the Railway bucket (batched, S3 caps at 1000 per call)."""
-    if not paths:
+def delete_files(keys: list[str]) -> None:
+    """Delete objects from the Railway bucket (batched, S3 caps at 1000 per call).
+    `keys` are S3 object keys, not URLs."""
+    if not keys:
         return
-    for i in range(0, len(paths), 1000):
-        batch = [{"Key": p} for p in paths[i:i + 1000]]
+    for i in range(0, len(keys), 1000):
+        batch = [{"Key": k} for k in keys[i:i + 1000]]
         s3.delete_objects(Bucket=R2_BUCKET, Delete={"Objects": batch, "Quiet": True})
 
 
-def upsert_storage_file_row(sku: str, path: str) -> None:
+def upsert_storage_file_row(sku: str, key: str) -> None:
     """Insert/update a row in storage_files_railway for this file.
-    Keyed on `path` so repeat uploads of the same key are idempotent on the DB side too.
+    `key` is the S3 object key (e.g. 'ALP2BLACK/product_1.jpeg').
+    The `path` column stores the full URL; `folder` and `file_name` are split from the key.
+    Keyed on `path` (full URL) so repeat uploads of the same file are idempotent on the DB side too.
     """
-    folder, _, file_name = path.rpartition("/")
+    folder, _, file_name = key.rpartition("/")
+    full_url = key_to_url(key)
     row = {
         "product_id": sku,
-        "path": path,
+        "path": full_url,
         "folder": folder,
         "file_name": file_name,
     }
@@ -149,13 +167,15 @@ def upsert_storage_file_row(sku: str, path: str) -> None:
     supabase.table("storage_files_railway").upsert(row, on_conflict="path").execute()
 
 
-def delete_storage_file_rows(paths: list[str]) -> None:
-    """Delete rows from storage_files_railway whose `path` matches (orphan cleanup)."""
-    if not paths:
+def delete_storage_file_rows(keys: list[str]) -> None:
+    """Delete rows from storage_files_railway whose `path` matches the URL form of the given keys.
+    `keys` are S3 object keys — we convert to URLs because `path` now stores full URLs."""
+    if not keys:
         return
+    urls = [key_to_url(k) for k in keys]
     # Supabase `in_` filter — batch by 200 to keep URL length sane
-    for i in range(0, len(paths), 200):
-        batch = paths[i:i + 200]
+    for i in range(0, len(urls), 200):
+        batch = urls[i:i + 200]
         try:
             supabase.table("storage_files_railway").delete().in_("path", batch).execute()
         except Exception:
@@ -211,7 +231,7 @@ async def sync_product_images(request: Request, _: None = Depends(verify_webhook
                 continue
 
             if exists:
-                results["already_present"].append(target_key)
+                results["already_present"].append(key_to_url(target_key))
                 try:
                     upsert_storage_file_row(sku, target_key)
                 except Exception as e:
@@ -230,33 +250,33 @@ async def sync_product_images(request: Request, _: None = Depends(verify_webhook
                 results["errors"].append(f"{item['base']} [image conversion]: {type(e).__name__}: {str(e)}")
                 continue
 
-            full_path = item["base"] + ext
+            full_key = item["base"] + ext
             expected_keys.discard(target_key)
-            expected_keys.add(full_path)
+            expected_keys.add(full_key)
 
             try:
-                upload_image(full_path, converted, mime)
+                upload_image(full_key, converted, mime)
             except Exception as e:
                 results["errors"].append(f"{item['base']} [put_object on Railway bucket]: {type(e).__name__}: {str(e)}")
                 continue
 
             try:
-                upsert_storage_file_row(sku, full_path)
+                upsert_storage_file_row(sku, full_key)
             except Exception as e:
                 results["errors"].append(f"{item['base']} [db upsert on Supabase]: {type(e).__name__}: {str(e)}")
                 # File is already uploaded, so count it as uploaded but flag the db error
-                results["uploaded"].append(full_path)
+                results["uploaded"].append(key_to_url(full_key))
                 continue
 
-            results["uploaded"].append(full_path)
+            results["uploaded"].append(key_to_url(full_key))
 
     # Orphan cleanup — list everything in the SKU folder, delete anything not in expected_keys.
-    existing = list_folder_files(folder)
-    to_delete = [k for k in existing if k not in expected_keys]
-    if to_delete:
-        delete_files(to_delete)
-        delete_storage_file_rows(to_delete)
-        results["deleted"].extend(to_delete)
+    existing_keys = list_folder_files(folder)
+    to_delete_keys = [k for k in existing_keys if k not in expected_keys]
+    if to_delete_keys:
+        delete_files(to_delete_keys)
+        delete_storage_file_rows(to_delete_keys)
+        results["deleted"].extend([key_to_url(k) for k in to_delete_keys])
 
     return {"success": True, "results": results}
 
@@ -316,19 +336,19 @@ async def sync_all_images(request: Request, _: None = Depends(verify_webhook_sec
 
                     raw_bytes, content_type = await download_image(client, item["url"])
                     converted, ext, mime = convert_image(raw_bytes, item["url"], content_type)
-                    full_path = item["base"] + ext
+                    full_key = item["base"] + ext
                     expected_keys.discard(target_key)
-                    expected_keys.add(full_path)
+                    expected_keys.add(full_key)
 
-                    upload_image(full_path, converted, mime)
-                    upsert_storage_file_row(sku, full_path)
+                    upload_image(full_key, converted, mime)
+                    upsert_storage_file_row(sku, full_key)
 
                 # Orphan cleanup per SKU folder
-                existing = list_folder_files(folder)
-                to_delete = [k for k in existing if k not in expected_keys]
-                if to_delete:
-                    delete_files(to_delete)
-                    delete_storage_file_rows(to_delete)
+                existing_keys = list_folder_files(folder)
+                to_delete_keys = [k for k in existing_keys if k not in expected_keys]
+                if to_delete_keys:
+                    delete_files(to_delete_keys)
+                    delete_storage_file_rows(to_delete_keys)
 
                 summary["processed"] += 1
             except Exception as e:
